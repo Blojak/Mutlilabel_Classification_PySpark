@@ -1,0 +1,643 @@
+###########################################################
+# Klassifikation von Scannerdaten mit Spark
+###########################################################
+'''
+Mittels Testdaten wird hier das PreProcessing angestoßen und in eine Pipeline
+gegossen. Darüberhinaus findet hier eine Kreuzvalidierung statt, welche die besten
+Modell-Parameter für das ML-Training isoliert. Das Trainierte Modell wird gepeichert
+und die Ergebnisse werden in csv Dateien gespeichert.
+
+INPUT: Daten mit Spalten:
+  - artikel_name, artikel_id, haendlerkategorie, ECOICOP
+OUTPUT:
+  parquet-Dateien:
+    - bestModel
+    - lable-Encoder
+    - preProcessPipeline
+  Tabellen (csv):
+    - 
+
+MODELL:
+  RandomForest:
+    - Feature selection ist kein "must-do task" für den RF Algorithmus (bei Text-Strings sowieso nicht). 
+    - Falls Outlier o.ä. im Dataset vorhanden sind, werden diese Features automatisch durch entropy(gini)-basiertes Knotenpunksplitting eliminiert.
+    - Multikollineraität spielt keine große Rolle (im Vergleich zu Logit z.B.)
+    - Bei Bedarf kann man sich leicht die FeatureImportance ausgeben lassen
+    - Es gibt nur wenige Hyperparamter die ge-tuned werden müssen
+    - RF ist gut parallelisierbar
+    - RF kann gut mit imbalanced data umgehen
+    
+    
+    Options:
+    - maxDepth
+    - maxBins: Number of bins used when discretizing continuous features.
+    - numTrees
+    - impurity (Criterion used for information gain calculation. 
+                For regression, must be "variance". For classification, 
+                must be one of "entropy" and "gini", default is "gini")
+    - bootstrap (Whether bootstrap samples are used when building trees)
+    - featureSubsetStrategy ("auto" (choose automatically for task: If numTrees == 1, 
+          set to "all." If numTrees > 1 (forest), set to "sqrt" for classification and 
+          to "onethird" for regression), "all" (use all features), 
+          "onethird" (use 1/3 of the features), "sqrt" (use sqrt(number of features)), 
+          "log2" (use log2(number of features)), "n": (when n is in the range (0, 1.0], 
+          use n * number of features. When n is in the range (1, number of features), 
+          use n features). Default is "auto".)
+    - subsamplingRate (Fraction of the training data used for learning each decision tree, in range (0, 1])
+    - minInstancesPerNode (Minimum number of instances each child must have after split)
+    - minInfoGain (Minimum information gain for a split to be considered at a tree node)
+    - checkpointInterval (Param for set checkpoint interval (>= 1) or disable checkpoint (-1). 
+              Note: this setting will be ignored if the checkpoint directory is not set)
+    - maxMemoryInMB (Maximum memory in MiB allocated to histogram aggregation)
+    - cacheNodeIds (If FALSE, the algorithm will pass trees to executors to match instances with nodes. 
+            If TRUE, the algorithm will cache node IDs for each instance. Caching can 
+            speed up training of deeper trees. Users can set how often should the cache 
+            be checkpointed or disable it by setting checkpointInterval)
+  see: https://www.rdocumentation.org/packages/SparkR/versions/3.1.2/topics/spark.randomForest
+
+
+Unterschied zwischen MultiClass und MultiLabel Classification Problem hier:
+https://stats.stackexchange.com/questions/11859/what-is-the-difference-between-multiclass-and-multilabel-problem
+
+'''
+
+# Lade Pakete
+#import databricks.koalas as ks
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_date, current_timestamp
+from pyspark.sql.functions import countDistinct
+from pyspark.sql.functions import concat, concat_ws,col
+from pyspark.sql.functions import lower, col, lit, when
+from pyspark.sql.functions import regexp_replace
+from pyspark.sql.functions import SparkContext
+from pyspark.sql.functions import udf
+from pyspark.sql.types import (StructType, 
+                               StructField, 
+                               StringType, 
+                               FloatType, 
+                               IntegerType, 
+                               ArrayType, 
+                               DoubleType)
+from pyspark.sql import DataFrame
+
+## ML
+from pyspark.ml.linalg import Vector
+from pyspark.ml.feature import ChiSqSelector
+from pyspark.ml.feature import HashingTF, IDF
+
+from pyspark.ml.feature import (Tokenizer, RegexTokenizer,
+                                VectorAssembler,
+                                CountVectorizer,
+                                IDF,
+                                StringIndexer,
+                                IndexToString,
+                                NGram)
+from pyspark.ml.classification import (LogisticRegression, 
+                                       RandomForestClassifier, 
+                                       RandomForestClassificationModel,
+                                       GBTClassifier,
+                                       GBTClassificationModel)
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.tuning import (CrossValidator,
+                               CrossValidatorModel,
+                               ParamGridBuilder)
+from pyspark.ml import Pipeline
+
+from pyspark import SparkContext
+
+
+# RDD ML packages
+from pyspark.mllib.evaluation import MulticlassMetrics
+from pyspark.mllib.linalg import Vectors
+# Importiere numpy, wegen der Top-N-Tabelle
+import datetime
+import numpy as np
+import pandas as pd
+import math
+import time
+
+### NEU ###
+from klassifikation_eigeneModule import CreateSelectionCol,RegexDf 
+
+start = time.process_time()
+
+# Lade Session
+spark = SparkSession.builder.appName('TrainingTuning').getOrCreate()
+sc=spark.sparkContext
+   
+# Konfiguration und Parameter Settings
+# -----------------------------------------------------
+# ID = 999 bezieht sich auf die polnischen Scannerdaten
+# Wenn das Modell mit default-Parametern trainiert werden soll, dann einfach tuning
+# auf "False" setzen
+
+TUNING = False
+AUCSCORE = False
+
+# TODO: HARDCODING ENTFERNEN
+shop_id = 102
+min_occur = 4 # Mindestabdeckung COICOP
+delim = ';'
+seeed = 52
+train_frac = 0.8 # Anteil Split in Trainingsdaten
+folds = 2
+prc = 1
+# Parametergitternetz fürs Tuning
+depth = [30]
+nutre = [100,200]
+imp = ['gini', 'entropy']
+ngrm = 3
+
+# Pfade
+# ----------------------------------------------------- / projects/ scannerdaten/ klassifikation/ trainingsdaten
+HDFS_ROOT="/projects/scannerdaten/"
+KLASSI = f'{HDFS_ROOT}klassifikation/'
+TDS = f'{KLASSI}/trainingsdaten/'
+RESULT_PATH = f'{KLASSI}transformer/'
+FILE_NAME = str(shop_id) + '_TDS.csv'
+RESULT_FILENAME = str(shop_id) + '_topList'
+
+FNAME = f"{TDS}{FILE_NAME}"
+RESULT_FILE = f"{RESULT_PATH}{RESULT_FILENAME}.csv"
+RESULT_TESTDATA = f"{KLASSI}fuer_testzwecke/"
+
+ycol = 'ECOICOP'
+Xcol = 'feature_string'
+
+# Lade Scannerdaten
+df = spark.read.csv(FNAME, sep = delim, header=True) # Achtung, die header wollen wir mitnehmen, sonst sind es Einträge
+
+## y-label:
+# -----------------------------------------------------
+# Zähle, wie of ein label auftaucht
+count_label = df.groupBy(ycol).count()
+#type(count_label)
+count_label = count_label.filter(count_label['count']>min_occur)
+
+# Wähle alle COICOPS, die in count_label stehen, also mindestens 4mal auftauchen
+df = df.join(count_label, on=ycol, how='left_semi') # (isin pendant)
+count_label.unpersist()
+
+## X - feature string
+# -----------------------------------------------------
+# Erstelle Feature Haendlerkategorie
+df = df.select(concat_ws(' ',df.artikel_name,df.haendlerkategorie)
+              .alias(Xcol),'*') # Alle Spalten wählen
+
+data = df 
+df.unpersist()
+
+
+## Pipeline PreProcessing
+# -----------------------------------------------------
+# Starte Prozesse der Pipeline
+regex = RegexDf(inputCol=Xcol, outputCol='regex')
+tokenizer = RegexTokenizer(inputCol=regex.getOutputCol(), outputCol='words', pattern='')
+ngram = NGram(n=ngrm,inputCol=tokenizer.getOutputCol(), outputCol='trigrams')
+count = CountVectorizer(inputCol=ngram.getOutputCol(), outputCol='countvec')
+#count = HashingTF(inputCol = ngram.getOutputCol(), outputCol="tf")
+tf_idf = IDF(inputCol=count.getOutputCol(), outputCol='tf_idf')
+indexer = StringIndexer(inputCol="ECOICOP", outputCol="label")
+vecAss_idf = VectorAssembler(inputCols=[tf_idf.getOutputCol()], outputCol='features')
+selector = ChiSqSelector(percentile= prc, featuresCol="features",
+                         outputCol="selectedFeatures", labelCol=indexer.getOutputCol())
+# Customized Step in PipeLine: Falls kein Feature Selection gewählt ist, erstelle entsprechende Spalte 
+createSelCol = CreateSelectionCol(inputCol=vecAss_idf.getOutputCol(), outputCol='selectedFeatures')
+
+# Der selector muss noch anständig konfiguriert werden
+
+# Definiere Pipeline
+## Encoder
+### Mit CountVectorizer und TF-IDF
+data_prep_pipe = Pipeline(stages=[regex,
+                                  tokenizer,
+                                  ngram,
+                                  count,
+                                  tf_idf,
+                                  indexer,
+                                  vecAss_idf,
+                                  createSelCol
+                                 ])
+# Save Pipeline
+fittedPipeline = data_prep_pipe.fit(data)
+if TUNING == False:
+#if TUNING != False:
+  fittedPipeline.write().overwrite().save(f"{RESULT_PATH}{str(shop_id)}_preProcessPipeline")
+
+data_prep = fittedPipeline.transform(data)
+data_prep = data_prep.dropDuplicates(['artikel_id']) 
+
+data.unpersist()
+
+## Train-Test-Split
+# -----------------------------------------------------
+## Weise jeder COICOP einen Anteil zu, wie hoch die Beteiligung im Sample sein soll.
+ratio = data_prep.select(ycol).distinct().withColumn("ratio", lit(train_frac)).rdd.collectAsMap()
+
+## Nutze sampleBy für geschichtete Ziehungen
+train = data_prep.stat.sampleBy(ycol, ratio, seeed)
+test = data_prep.join(train, on = 'artikel_id', how = 'left_anti')
+# Speicher Testdaten für weitere Analysemöglichkeiten
+test.write.options(delimiter=delim, header=True, encoding="UTF-8")\
+        .parquet(f"{RESULT_TESTDATA}{str(shop_id)}_testData.csv", mode="overwrite")
+
+  # Um ressourcenschonend zu arbeiten sollen hier nur die relevanten Spalten gewählt werden
+train = train.select(['selectedFeatures', 'label'])
+
+##############################################################################
+
+if TUNING == False:
+  # Wenn Tuning nicht konfiguriert wurde, nimm Benchmark-Kalibrierung GBTClassifier
+  rf = RandomForestClassifier(labelCol='label',
+                            featuresCol='selectedFeatures',
+                            seed=seeed,
+                            maxDepth = 30, #30 max
+                            numTrees = 200, #20  
+                            impurity = 'entropy',
+                            featureSubsetStrategy="auto"
+                           )
+  # featureSubsetStrategy = "auto" :choose automatically for task: If numTrees == 1, set to "all." 
+  # If numTrees > 1 (forest), set to "sqrt" for classification and to "onethird" for regression)
+  
+  # Lade Evaluierungs-Metrik
+  evaluator = MulticlassClassificationEvaluator()
+  
+  cvModel = rf.fit(train)
+  rf_BestModel = cvModel
+else:
+  # Erstelle das Modell
+  rf = RandomForestClassifier(labelCol='label',
+                              featuresCol='selectedFeatures',
+                              featureSubsetStrategy="auto",
+                              seed=seeed
+                             )
+
+  # Lade Evaluierungs-Metrik
+  evaluator = MulticlassClassificationEvaluator()
+
+  ## Parameter Tuning
+  # -----------------------------------------------------
+  # Das Tuning ist zunächst nur rudimentär für Testzwecke
+
+  # Erstelle ein Gitternetz mit Parametern zum Tunen
+  paramGrid = (ParamGridBuilder()
+              .addGrid(rf.maxDepth, depth) \
+              .addGrid(rf.numTrees, nutre) \
+              .addGrid(rf.impurity, imp)
+               #           .addGrid(rf.maxBins, [5, 10, 20,70])
+              .build()
+              )
+ 
+
+  # Kreuzvalidierung über
+  cv = CrossValidator(estimator=rf,
+                      evaluator=evaluator, 
+                      estimatorParamMaps=paramGrid,
+                      seed = seeed+10,
+                      numFolds=folds,
+                      collectSubModels=True) 
+
+  ## Training
+  # -----------------------------------------------------
+  # Starte Kreuzvalidierung zum Trainieren des Modells
+  cvModel = cv.fit(train)
+  
+  # Erhalte das beste Modell
+  rf_BestModel = cvModel.bestModel
+    
+  # -----------------------------------------------------
+  # Erhalte die besten Parameter
+  print('Best Param (maxDepth): ', rf_BestModel._java_obj.getMaxDepth())
+  print('Best Param (numTrees): ', rf_BestModel._java_obj.getNumTrees())
+  print('Best Param (maxBins): ', rf_BestModel._java_obj.getMaxBins())
+  print('Best Param (impurity): ', rf_BestModel._java_obj.getImpurity())
+  print('Modellinformationen', rf_BestModel)
+  
+  # Speicher das CV-Modell ab
+  cvModel.write().overwrite().save(f"{RESULT_PATH}{str(shop_id)}_crossValModel")
+  
+'''
+SubModels:
+ type(SubModels) = list
+ type(SubModels[0]) = list
+ type(SubModels[0][0]) = pyspark.ml.classification.RandomForestClassificationModel
+
+'''
+##----------------------------------------------------------------------------------
+# Lade "getuned-es" Modell zum Evaluieren. Hier insebesondere im Hinblick auf Over-fitting
+# Lade Python Packages
+if AUCSCORE != False:
+  import itertools
+  from sklearn.metrics import roc_auc_score
+
+  cvModel = CrossValidatorModel.load(f'{RESULT_PATH}{str(shop_id)}_crossValModel')
+  SubModels = cvModel.subModels # Später als csv speichern
+
+  
+  # Erhalte die Parameter Positionen
+
+  bagOfLists = [depth,imp,nutre] # alle Parameter
+  paramCombinations = list(itertools.product(*bagOfLists)) # alle Konstellationen
+  n = len(paramCombinations) # Länge
+
+  # Hier sollen Metriken für jedes SubModel berechnet werden. Dazu werden alle SubModelle
+  # geladen und z.B. der F1 Score berechnet. Über die Folds werden die Metriken dann
+  # via "mean" gemittelt.
+
+  # Initialisiere
+  parGridCV = []
+  predGrid = []
+  evaluator = MulticlassClassificationEvaluator()
+
+  for par in range (0,n): # über alle PAr-Konstellationen
+    # Initalisierung F1 Matrix über folds
+    F1Grid = np.zeros((folds, 2)) # fist col=train, second col =test
+    AucGrid = np.zeros((folds, 2))
+  
+    for fds in range(0,folds):
+      # Identifiziere Parameterkonstellationen
+      parGridCV.append([SubModels[fds][par]._java_obj.getMaxDepth(), 
+                        SubModels[fds][par]._java_obj.getNumTrees(),
+                        SubModels[fds][par]._java_obj.getImpurity()])
+      ## predictions
+      #train
+      yPred_train = SubModels[fds][par].transform(train)
+      yPred_test = SubModels[fds][par].transform(test)
+    
+      # Präperiere für sklearn
+      # --> bring alles in np.array-Format
+      yPred_train_array = np.array(yPred_train.select(['label']).collect()).astype(int)[:,0]
+      yPred_test_array = np.array(yPred_test.select(['label']).collect()).astype(int)[:,0]
+      prob_train_array = np.array(yPred_train.select(['probability']).collect())[:,0,:]
+      prob_test_array = np.array(yPred_test.select(['probability']).collect())[:,0,:]
+ 
+    
+      evaluator = evaluator.setPredictionCol('prediction').setLabelCol('label')
+      F1Grid[fds,0] = evaluator.evaluate(yPred_train,{evaluator.metricName: 'f1'})
+      F1Grid[fds,1] = evaluator.evaluate(yPred_test,{evaluator.metricName: 'f1'})
+
+      AucGrid[fds,0] = roc_auc_score(yPred_train_array, prob_train_array, multi_class='ovr')
+      AucGrid[fds,1] = roc_auc_score(yPred_test_array, prob_test_array, multi_class='ovr')
+    
+    predGrid.append([np.mean(F1Grid,axis=0), np.mean(F1Grid,axis=0)[0]-np.mean(F1Grid,axis=0)[1],
+                     np.mean(AucGrid,axis=0), np.mean(AucGrid,axis=0)[0]-np.mean(AucGrid,axis=0)[1], 
+                    [SubModels[fds][par]._java_obj.getMaxDepth(), 
+                    SubModels[fds][par]._java_obj.getNumTrees(),
+                    SubModels[fds][par]._java_obj.getImpurity()]
+                    ])
+
+### TMP 1111 ##################################################################################
+#rf_BestModel = RandomForestClassificationModel.load(f'{KLASSI}transformer/{shop_id}_bestModel/')
+
+
+### Predictions
+# -----------------------------------------------------
+# Hier ----> 1 y_pred_train = rf_BestModel.transform(train) does not exist
+
+y_pred_train = rf_BestModel.transform(train)
+y_pred_test = rf_BestModel.transform(test)
+ 
+labels = fittedPipeline.stages[5] # Index to String
+converter = IndexToString(inputCol='prediction', outputCol='coicop',labels=labels.labels)
+
+y_pred_train = converter.transform(y_pred_train)
+y_pred_test = converter.transform(y_pred_test)
+
+
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+'''
+## Evaluation
+# PySpark > 3.0
+#evaluator = evaluator.setPredictionCol('prediction').setLabelCol('label')
+#F1 = evaluator.evaluate(y_pred,{evaluator.metricName: 'f1'})
+#ACCURACY = evaluator.evaluate(y_pred,{evaluator.metricName: 'accuracy'})
+#
+## Weitere Metriken
+#PRECISION = evaluator.evaluate(y_pred,{evaluator.metricName: "precisionByLabel"})
+## Die Precision gibt den Anteil an richtig vorhergesagten positiven Ergebnissen (TP) 
+## bezogen auf die Gesamtheit aller als positiv vorhergesagten Ergebnisse an
+#
+#RECALL = evaluator.evaluate(y_pred,{evaluator.metricName: 'recallByLabel'})
+## Der Recall oder auch Hit-Rate genannt gibt den Anteil der korrekt als positiv 
+## klassifizierten Ergebnisse (TP) bezogen auf die Gesamtheit der tatsächlich 
+## positiven Ergebnisse (P) an
+
+# -----------------------------------------------------
+# PySpark 2.4
+# Weil PySpark 2.4 leider die multicalss-Metriken nicht vollständig bereitstellt, 
+# wird hier zunächst auf die "mllib"-Bibliothek zurückgegriffen. 
+# Für diesen Zweck muss erst ein RDD gebildet werden. Anschließend werden die Predictions und
+# das korrekte label in Tupel verpackt und an ein neuen RDD übergeben. Anschließend können die
+# Metriken aus dem package verwendet werden
+# https://spark.apache.org/docs/2.2.0/mllib-evaluation-metrics.html
+
+
+# Matthews correlation coefficient
+#---------------------------------------------------
+Entspricht der Korrelation der korrekten und predicted values (ähnlich zu Pearsons's Koeffizient)
+MCC = [-1,1]
+Wenn MCC = 0, dann ist der Schätzer nicht besser als der Zufall
+Diese Metrik bezieht alle Matrix Terme mit ein. Somit spielen nicht nur die korrekt´geschätzen Terme eine Rolle,
+sondern auch die FalseNegative. 
+Der Matthews-Korrelationskoeffizient ist bei der Bewertung von Klassifizierungsproblemen aussagekräftiger 
+als F1 und Accuracy, da dieser die Gleichgewichtsverhältnisse der vier Kategorien der Konfusionsmatrix 
+(richtig positiv, richtig negativ, falsch positiv, falsch negativ) berücksichtigt.
+Ergänzend zu Recall und Precision Im Gegensatz zu Präzision und Recall ergibt das Vertauschen 
+von positiven und negativen Klassen die gleiche Punktzahl. 
+Dem MCC is es nur wichtig, dass jede Klasse gut vorhergesagt wird, unabhängig von der Unausgewogenheit der Klassen.
+Allgemein kann man sagen, dass alle Scores > 0.7 als gut erachtet werden.
+All in all, F1>90% muss nicht implizieren, dass das Modell besser als eine Zufallsziehung ist. 
+Deswegen zieht man den MCC hinzu.
+https://en.m.wikipedia.org/wiki/Phi_coefficient
+
+# Cohen's kappa coefficient
+#---------------------------------------------------
+Auch "inter-rater reliability".
+COICOPS mit vielen TPs (high level of agreement) sind vertrauenswürdiger als klassen, wo
+es nur wenige korrekt klassifizierte Artikel gibt. kappa misst den Grad des "Agreement", also wie 
+vertrauenswürdig manche geschätzte Klassen sind.
+Wie konsistent bewertet das Modell.
+
+'''
+
+#F1_test = evaluator.evaluate(y_pred_test,{evaluator.metricName: 'f1'})
+#ACCURACY_test = evaluator.evaluate(y_pred_test,{evaluator.metricName: 'accuracy'})
+#F1_train = evaluator.evaluate(y_pred_train,{evaluator.metricName: 'f1'})
+#ACCURACY_train = evaluator.evaluate(y_pred_train,{evaluator.metricName: 'accuracy'})
+#
+#print('F1 Score Test:',F1_test,'\n','F1 Score Train:', F1_train)
+#print('Accuracy Test:',ACCURACY_test,'\n','Accuracy Train:', ACCURACY_train)
+
+
+## test (als Tupel)
+predictionAndLabels = sc.parallelize(y_pred_test.select(['prediction', 'label']).collect())
+predictionAndLabelTuple = predictionAndLabels.map(lambda lp: (lp.prediction, lp.label))
+rddMetrics = MulticlassMetrics(predictionAndLabelTuple)
+#
+## train (als Tupel)
+predictionAndLabels_train = sc.parallelize(y_pred_train.select(['prediction', 'label']).collect())
+predictionAndLabelTuple_train = predictionAndLabels_train.map(lambda lp: (lp.prediction, lp.label))
+rddMetrics_train = MulticlassMetrics(predictionAndLabelTuple_train)
+#
+# Allgemeine (ungewichtete) Statistiken (Testdaten)
+PRECISION = rddMetrics.precision()
+RECALL = rddMetrics.recall()
+F1 = rddMetrics.fMeasure()
+ACCURACY = rddMetrics.accuracy
+
+PRECISION_train = rddMetrics_train.precision()
+RECALL_train = rddMetrics_train.recall()
+F1_train = rddMetrics_train.fMeasure()
+ACCURACY_train = rddMetrics_train.accuracy
+#
+print('F1 Score Test:',F1,'\n','F1 Score Train:', F1_train)
+print('Accuracy Test:',ACCURACY,'\n','Accuracy Train:', ACCURACY_train)
+
+# Berechne Konfusions-Matrix
+cm = rddMetrics.confusionMatrix().toArray()
+NumClasses = len(cm)
+
+# Berechne die True Positives (Diagonale)
+TruePositive = np.diag(cm)
+
+# Die False Positives sind die Summe der jeweiligen Spalte, 
+# minus der diagonalen Elemente
+FalsePositive = []
+for i in range(NumClasses):
+    FalsePositive.append(sum(cm[:,i]) - cm[i,i])
+FalsePositive = np.array(FalsePositive)
+    
+# Die False Negatives entsprechen die Summen der jeweiligen Zeilen minus der diagonalen Elemente
+FalseNegative = []
+for i in range(NumClasses):
+    FalseNegative.append(sum(cm[i,:]) - cm[i,i])
+FalseNegative = np.array(FalseNegative)
+
+# Die True Negatives sind trickreicher: alle Schätzer die korrekt als nicht "True" identifiziert wurden. 
+# Technisch gesehen löschen wir die jeweiligen Zeilen und Spalten aus der Confusion Matrix und Summieren über die übrigen
+# Elemente 
+TrueNegative = []
+for i in range(NumClasses):
+    temp = np.delete(cm, i, 0)   # lösche i-te Zeile
+    temp = np.delete(temp, i, 1)  # lösche i-te Spalte
+    TrueNegative.append(sum(sum(temp)))
+TrueNegative = np.array(TrueNegative)
+    
+# Check ob die Matrix Terme korrekt sind:
+# dafür muss die Summe aller Metriken der Anzahl der Artikel aus den Testdaten entsprechen
+l = test.count()
+
+check = []
+for i in range(NumClasses):
+    check.append(TruePositive[i] + FalsePositive[i] + FalseNegative[i] + TrueNegative[i] == l)
+if False in check:
+  print('Etwas ist schief gelaufen')
+else:
+  print('Confusion Matrix korrekt extrahiert')
+
+## F1 manuell
+#---------------------------------------------------
+F1_perLabel = []
+for i in range(NumClasses):
+  F1_perLabel.append((TruePositive[i])/(TruePositive[i]+0.5*(FalsePositive[i]+FalseNegative[i]))) 
+F1_macro = np.mean(F1_perLabel)
+# Matthews correlation coefficient
+#---------------------------------------------------
+
+MCC = []
+for i in range(NumClasses):
+  discriminant = (TruePositive[i] + FalsePositive[i])\
+      * (TruePositive[i] + FalseNegative[i]) * (FalsePositive[i] + TrueNegative[i])\
+      * (TrueNegative[i] + FalseNegative[i])
+  if discriminant == 0:
+    discriminant =1
+      
+  MCC.append(
+    (TruePositive[i] * TrueNegative[i] - FalsePositive[i] * FalseNegative[i])\
+    / math.sqrt(discriminant)
+            )
+    
+MCC_mean = np.mean(MCC)
+
+# Cohen's Kappa coefficient
+#---------------------------------------------------
+def kappa(tp, tn, fp, fn):
+    N = tp+tn+fp+fn
+    # Probability observed
+    Po = float(tp+tn)/N
+    # Probability expected
+    Pe = float(((tn+fp)*(tn+fn))+((fn+tp)*(fp+tp)))/(N*N)
+    # Cohen's kappa Coefficient
+    kappa = float(Po-Pe)/(1-Pe)
+    return(kappa)
+  
+CohenKappa = []
+for i in range(NumClasses):
+  CohenKappa.append(kappa(TruePositive[i], 
+                          TrueNegative[i], 
+                          FalsePositive[i], 
+                          FalseNegative[i]))
+CohenKappa_mean = np.mean(CohenKappa)
+
+
+## Save Parameters
+#--------------------------------------------------
+now = datetime.datetime.now()
+
+# Speicher die Parameter in DF
+df_BestParam = spark.createDataFrame(
+    [(now.strftime('%Y-%m-%d'), 
+      str(shop_id), 
+      rf_BestModel._java_obj.getMaxDepth(),
+      rf_BestModel._java_obj.getNumTrees(),
+      rf_BestModel._java_obj.getMaxBins(),
+      rf_BestModel._java_obj.getImpurity(),
+      "{:.3f}".format(ACCURACY),
+      "{:.3f}".format(F1_macro),
+     "{:.3f}".format(PRECISION),
+     "{:.3f}".format(RECALL),
+     float("{:.3f}".format(MCC_mean)),
+     float("{:.3f}".format(CohenKappa_mean)))],
+    ['current_date',"shop", "maxDepth", "numTrees","maxBins",\
+     'impurity',"accuracy", "f1", 'precision','recall','MCC', 'Cohens kappa']) #'precision', 'recall',
+
+df_BestParam.show()    
+df_BestParam.write.options(delimiter=",", header=True, encoding="UTF-8")\
+        .csv(f"{RESULT_PATH}{str(shop_id)}_topParams.csv", mode="append")
+
+#df_BestParam=spark.read.csv(f"{RESULT_PATH}{str(shop_id)}_topParams.csv", header=True, encoding="UTF-8")
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+# ----------------------------------------------------- 
+# Finales Training für die Übergabe des Klassifikators
+# ----------------------------------------------------- 
+if TUNING != False: # default= False
+#if TUNING == False: # default= False
+
+  rf_final = RandomForestClassifier(labelCol='label',
+                            featuresCol='selectedFeatures',
+                            seed=seeed,
+                            maxDepth = rf_BestModel._java_obj.getMaxDepth(),
+                            numTrees = rf_BestModel._java_obj.getNumTrees(),        
+                            impurity = rf_BestModel._java_obj.getImpurity(),
+                            maxBins = rf_BestModel._java_obj.getMaxBins(),
+                            featureSubsetStrategy="auto"
+                           )
+
+  finalModel = rf_final.fit(data_prep)
+  # Speicher das Modell ab
+  finalModel.write().overwrite().save(f"{RESULT_PATH}{str(shop_id)}_bestModel")
+  
+# Zeitausgabe  
+elapsedTime = time.process_time() - start
+print('benötigte Zeit (in Minuten):', elapsedTime)
+
+#spark.stop()

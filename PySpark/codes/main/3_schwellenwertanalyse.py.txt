@@ -1,0 +1,309 @@
+
+'''
+###########################################################
+# Workflow Klassifikation in Emere
+###########################################################
+
+'''
+
+# Lade Pakete
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import countDistinct
+from pyspark.sql.functions import concat, concat_ws,col
+from pyspark.sql.functions import lower, col, lit, when
+from pyspark.sql.functions import regexp_replace
+from pyspark.sql.functions import SparkContext
+from pyspark.sql.functions import udf
+
+from pyspark.sql.functions import udf, array_max
+from pyspark.sql.types import (StructType, 
+                               StructField, 
+                               StringType, 
+                               FloatType, 
+                               IntegerType, 
+                               ArrayType, 
+                               DoubleType)
+#import pyspark.sql.types as T
+
+## ML
+#from pyspark.ml.functions import vector_to_array
+from pyspark.ml.linalg import Vector, Vectors
+from pyspark.ml.feature import ChiSqSelector
+from pyspark.ml.feature import HashingTF, IDF
+
+# from pyspark.mllib.feature import HashingTF, IDF
+from pyspark.ml.feature import (Tokenizer, RegexTokenizer,
+                                VectorAssembler,
+                                CountVectorizer,
+                                IDF,
+                                StringIndexer,
+                                IndexToString,
+                                NGram)
+from pyspark.ml.classification import RandomForestClassifier, RandomForestClassificationModel
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark import SparkContext
+import numpy as np
+
+from klassifikation_eigeneModule import CreateSelectionCol,RegexDf 
+from emere_config import *
+
+#
+from sklearn.metrics import f1_score, accuracy_score
+from sklearn.metrics import roc_curve, auc
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
+import matplotlib.pyplot as plt
+
+# Lade Session
+# Einrichtung der Spark-Session
+spark = SparkSession \
+    .builder \
+    .appName("Emere_Datenaufbereitung") \
+    .enableHiveSupport() \
+    .config("spark.sql.crossJoin.enabled", "true") \
+    .getOrCreate()
+
+sc=spark.sparkContext
+
+# Konfiguration und Parameter Settings
+# -----------------------------------------------------
+# ID = 999 bezieht sich auf die polnischen Scannerdaten
+# Wenn das Modell mit default-Parametern trainiert werden soll, dann einfach tuning
+# auf "False" setzen
+
+# Pfade und Konfiguraionsdateien
+
+df_tmp = spark.read.text(f"{HDFS_ROOT}{EMERE_KONFIGURATION}{KONFIGURATION_KLASSIFIKATOR}")
+t = df_tmp.collect() # DF zu Liste
+
+# Erstelle Dictionary mit allen Konfigurations-Parametern
+confList = {}
+for d in t: confList[d.value.split(':')[0]] = d.value.split(':')[1].replace(' ','')
+  
+df_tmp.unpersist() # Speicher freigeben
+
+# Extrahiere Parameter damit diese separat abgerufen werden können
+delim = confList['trennzeichen']
+seeed = int(confList['random_seed'])
+p_list = [float(x) for x in confList['akzeptanzschwellwerte'].split(',')]
+shop_list = [str(x) for x in confList['handelsketten_id'].split(',')]
+keine_wg_klassifikation = [str(x) for x in confList['keine_warengruppen_klassifikation'].split(',')]
+keine_ml_klassifikation = [str(x) for x in confList['keine_ml_klassifikation'].split(',')]
+Xcol = confList['bezeichner_feature_daten']
+
+# Pfade (AUCH AUS CONFIG DATEI ZIEHEN)
+ssp = '102'
+data_test = f'{KLASSIFIKATION}fuer_testzwecke/{ssp}_testData.csv'
+
+
+## Lade die Pre-Processing Pipeline
+# ---------------------------------------------------------------
+# Erstelle Dictionary, damit jeder Handelskette ein Schwellenwert zugewiesen werden kann. 
+# Achtung: Die Länge von "shop_list" und "p_list" müssen identisch sein, anders funktionieren 
+# die multiplen Iterationen nicht
+p_min = {}
+for shp, pshp in zip(shop_list, p_list):
+  p_min[str(shp)] = pshp
+
+# Initialisiere ein dictionary, damit jeder Handelskette Module zugewiesen werden kann
+shp = ssp
+modules = {}
+
+datPipe = confList[str(shp)].split(',')[0]
+dataMod = confList[str(shp)].split(',')[1]
+dataWg = confList[str(shp)].split(',')[2] 
+
+  
+# Manche Handelsketten haben keine brauchbaren Warengruppen, die müssen abgefangen/ausgeleitet werden
+if str(shp) in keine_wg_klassifikation:
+  wgs = None
+else:
+  wgs = spark.read.csv(f'{KLASSIFIKATION}{WARENGRUPPEN}{dataWg}', sep = delim, header=True)
+    
+# Für die Shops wo wir alles manuell klassifizieren
+if str(shp) in keine_ml_klassifikation:
+  piLi = None
+  bestModel = None
+else:
+  piLi =  PipelineModel.load(f'{KLASSIFIKATION}{TRANSFORMER}{datPipe}')
+  bestModel = RandomForestClassificationModel.load(f'{KLASSIFIKATION}{TRANSFORMER}{dataMod}')
+  
+## Modul Index:         0       1        2    
+modules[str(shp)] = [piLi, bestModel, wgs]           
+
+
+## Lade Testdaten (INPUT_DATA) 
+# ---------------------------------------------------------------
+df_klassifikation = spark.read.parquet(data_test) # HAUPTUNTERSCHIED ZU PREDICTION
+df_klassifikation = df_klassifikation.withColumnRenamed('artikel_name', 'artikelname')
+df_klassifikation = df_klassifikation.withColumnRenamed('haendlerkategorie', 'unternehmensinterne_klassifizierung')
+df_klassifikation = df_klassifikation.dropDuplicates(['artikel_id'])
+# TMP
+df_klassifikation = df_klassifikation.withColumn('handelsketten_id', lit(ssp))
+
+## Handelsketten-IDS isolieren
+# ---------------------------------------------------------------
+
+# Initialisiere den finalen DataFrame
+cols = ['artikel_id','artikelname','unternehmensinterne_klassifizierung','handelsketten_id', 'p','coicop']
+schema = StructType([
+  StructField(cols[0], StringType(), True),
+  StructField(cols[1], StringType(), True),
+  StructField(cols[2], StringType(), True),
+  StructField(cols[3], StringType(), True),
+  StructField(cols[4], StringType(), True),
+  StructField(cols[5], StringType(), True)
+  ])
+
+# Filter die "handelsketten_id" und iteriere über diese
+shop_id = shp
+
+# Erstelle DF für jeden Dataframe, damit nicht bei jedem Abruf ein Filter gesetzt werden muss  
+df_shopData = df_klassifikation.filter(df_klassifikation['handelsketten_id']== shop_id)
+
+## Lade Test-Warengruppen
+# ---------------------------------------------------------------
+if shop_id in keine_wg_klassifikation: # oder modules[shop_id][2] == None
+    # Falls keine Warengruppen für die Klassifikation verwertbar sind, erstelle leeren DataFrame 
+  warengruppen_zuordnung = spark.createDataFrame([], schema)
+else:  
+  warengruppen_zuordnung = modules[shop_id][2]
+  # Spaltennamen anpassen
+  warengruppen_zuordnung = warengruppen_zuordnung.withColumnRenamed('haendlerkategorie', 'unternehmensinterne_klassifizierung')
+  warengruppen_zuordnung = warengruppen_zuordnung.withColumnRenamed('ECOICOP', 'coicop')
+  # Reduziere auf die notwendigen Spatlen
+  warengruppen_zuordnung = warengruppen_zuordnung.select(['unternehmensinterne_klassifizierung', 'coicop']) 
+
+  # Bevor es zuvor vergessen wurde: Hier werden nochmal alle Duplikate der
+  # klassifizierten Händlerkategorien entfernt, damit es beim "Mergen" keine Probleme gibt
+  warengruppen_zuordnung = warengruppen_zuordnung.dropDuplicates(['unternehmensinterne_klassifizierung'])
+
+## Merge/Join
+# ---------------------------------------------------------------
+  warengruppen_zuordnung = df_shopData.join(warengruppen_zuordnung,on='unternehmensinterne_klassifizierung',how='inner')\
+                                      .orderBy('unternehmensinterne_klassifizierung', ascending=True)
+
+  # Spalte mit der Wahrscheinlichkeit 'p' hinzufügen - im "double" Format
+  warengruppen_zuordnung = warengruppen_zuordnung.withColumn('p', lit('1').cast('double'))    
+  
+# Bestimme die Artikel, die in den ML-Part geleitet werden
+predictedLabel = df_shopData
+    
+predictedLabel = modules[shop_id][1].transform(predictedLabel) # Modell
+
+rf_BestModel = modules[shop_id][1]
+# Erhalte die besten Parameter
+print('Best Param (maxDepth): ', rf_BestModel._java_obj.getMaxDepth())
+print('Best Param (numTrees): ', rf_BestModel._java_obj.getNumTrees())
+print('Best Param (maxBins): ', rf_BestModel._java_obj.getMaxBins())
+print('Best Param (impurity): ', rf_BestModel._java_obj.getImpurity())
+print('Modellinformationen', rf_BestModel)
+
+
+# Lade Converter aus der Pipeline hinaus
+
+labels = modules[shop_id][0].stages[5]
+converter = IndexToString(inputCol='prediction', outputCol='coicop',labels=labels.labels)
+predictedLabel = converter.transform(predictedLabel)
+to_array = udf(lambda v: v.toArray().tolist(), ArrayType(FloatType()))
+predictedLabel = predictedLabel.withColumn('p', array_max(to_array('probability')))
+  
+## Ausleitung vorbereiten durch COICOP-Löschung
+# ------------------------------------------------------------------------
+# Identifiziere alle Artikel bei denen die Korrektklassifikations-Wahrscheinlichkeit
+# unter einer gewissen Grenze liegt (p_min) und überschreibe die COICOP mit "NICHTS"
+
+#predictedLabel = predictedLabel.withColumn('coicop', 
+#                                when(predictedLabel.p <p_min[shop_id], None)
+#                                .otherwise(predictedLabel.coicop))
+# OPTIONAL
+#predictedLabel = predictedLabel.select(warengruppen_zuordnung.columns).union(warengruppen_zuordnung)
+#warengruppen_zuordnung.unpersist()
+
+## Schwellenwertanalyse
+# ------------------------------------------------------------------------
+df = predictedLabel.toPandas()
+cols = ['artikel_id','artikelname', 'selectedFeatures','unternehmensinterne_klassifizierung','ECOICOP','coicop', 'p']
+df = df[cols]
+
+
+# sklean nimmt nur arrays, deswegen squeeze it!
+y_true = df.ECOICOP.values
+y_pred = df.coicop.values 
+
+# F1 zum korrigieren und als Kriterium
+F1 = f1_score(y_true, y_pred, average='macro')
+print('Achtung! Der F1 Score in diesem Programmabschnitt ist verzerrt, da dass zugrundeliegende\
+mit allen Daten trainiert wurde und der Testdatensatz ein Subset ist')
+F1_MICRO = f1_score(y_true, y_pred, average='micro')
+ACC = accuracy_score(y_true, y_pred)
+print('F1', F1,'\n', 'ACCURACY', ACC)
+
+# Definiere Domain für p 
+p_list = np.arange(0, 1.0, 0.01)
+
+stats = np.zeros((len(p_list),5))
+
+
+for ind, prob in enumerate(p_list):
+  df_tmp = df.copy()
+  df_tmp.p = df_tmp.p.apply(lambda x: x if float(x)>=prob else np.nan)
+  stats[ind,0] = "{:.4f}".format(prob)
+  stats[ind,1] = "{:.4f}".format(np.round(df_tmp[df_tmp.p.isna()].shape[0]/len(df.p), 4))
+  stats[ind,2] = df_tmp[df_tmp.p.isna()].shape[0]
+  df_tmp = df_tmp.dropna()
+  ytrue = df_tmp.ECOICOP.values
+  ypred = df_tmp.coicop.values
+  f1Sc = f1_score(ytrue, ypred, average='macro')
+  accu = accuracy_score(ytrue, ypred)
+  stats[ind,3] = "{:.4f}".format(np.round(f1Sc, 4))
+  stats[ind,4] = "{:.4f}".format(np.round(accu, 4))
+  
+
+
+# plot lines
+plt.plot(stats[:,0], stats[:,3], label = "line 1")
+plt.plot(stats[:,0], stats[:,1], label = "line 2")
+#plt.plot(x, np.sin(x), label = "curve 1")
+#plt.plot(x, np.cos(x), label = "curve 2")
+#plt.legend()
+plt.show()
+
+
+
+
+
+
+
+
+#classes = np.unique(y_true)
+#yp = label_binarize(y_pred, classes=classes)
+#yt = label_binarize(y_true, classes=classes)
+## Compute ROC curve and ROC area for each class
+#fpr = dict()
+#tpr = dict()
+#roc_auc = dict()
+#
+#for i in range(len(n_classes)):
+#    fpr[i], tpr[i], _ = roc_curve(yt[:, i], yp[:, i])
+#    roc_auc[i] = auc(fpr[i], tpr[i])
+#
+## Compute micro-average ROC curve and ROC area
+#fpr["micro"], tpr["micro"], _ = roc_curve(yt.ravel(), yp.ravel())
+#roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+#
+## Plot of a ROC curve for a specific class
+#for i in range(len(n_classes)):
+#    plt.figure()
+#    plt.plot(fpr[i], tpr[i], label='ROC curve (area = %0.2f)' % roc_auc[i])
+#    plt.plot([0, 1], [0, 1], 'k--')
+#    plt.xlim([0.0, 1.0])
+#    plt.ylim([0.0, 1.05])
+#    plt.xlabel('False Positive Rate')
+#    plt.ylabel('True Positive Rate')
+#    plt.title('Receiver operating characteristic example')
+#    plt.legend(loc="lower right")
+#    plt.show()
